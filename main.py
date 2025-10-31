@@ -1,32 +1,45 @@
+# main.py
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
-import requests, uuid, piexif, os
+from pydantic import BaseModel
+import base64, io, piexif
+from PIL import Image
 
 app = FastAPI()
 
-def deg_to_dmsRational(deg_float):
-    deg = int(deg_float)
-    minutes_float = abs(deg_float - deg) * 60
-    minutes = int(minutes_float)
-    seconds = round((minutes_float - minutes) * 60 * 10000)
-    return ((abs(deg), 1), (minutes, 1), (seconds, 10000))
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
 
-@app.get("/geotag")
-def geotag(image_url: str, lat: float, lng: float):
-    img_data = requests.get(image_url).content
-    temp_filename = f"/tmp/{uuid.uuid4()}.jpg"
-    with open(temp_filename, "wb") as f:
-        f.write(img_data)
+class GeoTagRequest(BaseModel):
+    image_base64: str          # data URI or raw base64 of a JPEG/PNG
+    latitude: float
+    longitude: float
 
-    gps_ifd = {
-        piexif.GPSIFD.GPSLatitude: deg_to_dmsRational(lat),
-        piexif.GPSIFD.GPSLatitudeRef: "N" if lat >= 0 else "S",
-        piexif.GPSIFD.GPSLongitude: deg_to_dmsRational(lng),
-        piexif.GPSIFD.GPSLongitudeRef: "E" if lng >= 0 else "W",
+def _to_deg(value: float):
+    d = int(abs(value))
+    m_full = (abs(value) - d) * 60
+    m = int(m_full)
+    s = int(round((m_full - m) * 60 * 100))
+    return ((d, 1), (m, 1), (s, 100))
+
+@app.post("/geotag")
+def geotag(req: GeoTagRequest):
+    raw = req.image_base64.split(",")[-1]  # strip data URI if present
+    img_bytes = base64.b64decode(raw)
+
+    # ensure JPEG output for EXIF
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+    gps = {
+        piexif.GPSIFD.GPSLatitudeRef: b"N" if req.latitude >= 0 else b"S",
+        piexif.GPSIFD.GPSLongitudeRef: b"E" if req.longitude >= 0 else b"W",
+        piexif.GPSIFD.GPSLatitude: _to_deg(req.latitude),
+        piexif.GPSIFD.GPSLongitude: _to_deg(req.longitude),
     }
-
-    exif_dict = {"GPS": gps_ifd}
+    exif_dict = {"GPS": gps}
     exif_bytes = piexif.dump(exif_dict)
-    piexif.insert(exif_bytes, temp_filename)
 
-    return FileResponse(temp_filename, media_type="image/jpeg")
+    out = io.BytesIO()
+    img.save(out, format="JPEG", exif=exif_bytes)
+    b64 = base64.b64encode(out.getvalue()).decode("utf-8")
+    return {"image_base64": f"data:image/jpeg;base64,{b64}"}

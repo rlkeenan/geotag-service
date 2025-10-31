@@ -1,4 +1,5 @@
 fastapi
-uvicorn
-requests
+uvicorn[standard]
+pillow
 piexif
+pydantic

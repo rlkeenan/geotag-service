@@ -1,45 +1,81 @@
 # main.py
-from fastapi import FastAPI
-from pydantic import BaseModel
-import base64, io, piexif
+from fastapi import FastAPI, UploadFile, File, Form, Response, HTTPException
+from fastapi.responses import JSONResponse
+from typing import Optional
 from PIL import Image
+import piexif
+import io
 
-app = FastAPI()
+app = FastAPI(title="Geotag Service")
 
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
 
-class GeoTagRequest(BaseModel):
-    image_base64: str          # data URI or raw base64 of a JPEG/PNG
-    latitude: float
-    longitude: float
-
-def _to_deg(value: float):
-    d = int(abs(value))
-    m_full = (abs(value) - d) * 60
-    m = int(m_full)
-    s = int(round((m_full - m) * 60 * 100))
-    return ((d, 1), (m, 1), (s, 100))
+def _to_dms_rationals(value: float):
+    """Convert decimal degrees to EXIF DMS rationals"""
+    sign = 1 if value >= 0 else -1
+    v = abs(value)
+    deg = int(v)
+    minutes_float = (v - deg) * 60
+    minutes = int(minutes_float)
+    seconds = round((minutes_float - minutes) * 60, 6)
+    # Use integer rationals to avoid float in EXIF
+    return (
+        (deg, 1),
+        (minutes, 1),
+        (int(seconds * 1_000_000), 1_000_000),
+    ), sign
 
 @app.post("/geotag")
-def geotag(req: GeoTagRequest):
-    raw = req.image_base64.split(",")[-1]  # strip data URI if present
-    img_bytes = base64.b64decode(raw)
+async def geotag(
+    file: UploadFile = File(...),
+    lat: float = Form(...),
+    lon: float = Form(...),
+    address: Optional[str] = Form(None),
+):
+    try:
+        raw = await file.read()
+        if not raw:
+            raise HTTPException(status_code=400, detail="Empty file")
 
-    # ensure JPEG output for EXIF
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        # Ensure JPEG output
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=95)
+        jpeg_bytes = buf.getvalue()
 
-    gps = {
-        piexif.GPSIFD.GPSLatitudeRef: b"N" if req.latitude >= 0 else b"S",
-        piexif.GPSIFD.GPSLongitudeRef: b"E" if req.longitude >= 0 else b"W",
-        piexif.GPSIFD.GPSLatitude: _to_deg(req.latitude),
-        piexif.GPSIFD.GPSLongitude: _to_deg(req.longitude),
-    }
-    exif_dict = {"GPS": gps}
-    exif_bytes = piexif.dump(exif_dict)
+        # Build EXIF GPS
+        lat_dms, lat_sign = _to_dms_rationals(lat)
+        lon_dms, lon_sign = _to_dms_rationals(lon)
 
-    out = io.BytesIO()
-    img.save(out, format="JPEG", exif=exif_bytes)
-    b64 = base64.b64encode(out.getvalue()).decode("utf-8")
-    return {"image_base64": f"data:image/jpeg;base64,{b64}"}
+        gps_ifd = {
+            piexif.GPSIFD.GPSLatitudeRef: b"N" if lat_sign >= 0 else b"S",
+            piexif.GPSIFD.GPSLatitude: lat_dms,
+            piexif.GPSIFD.GPSLongitudeRef: b"E" if lon_sign >= 0 else b"W",
+            piexif.GPSIFD.GPSLongitude: lon_dms,
+        }
+
+        exif_ifd = {}
+        if address:
+            # EXIF UserComment (must be ASCII header + bytes)
+            exif_ifd[piexif.ExifIFD.UserComment] = b"ASCII\x00\x00\x00" + address.encode("ascii", "ignore")
+
+        exif_dict = {"0th": {}, "Exif": exif_ifd, "GPS": gps_ifd, "1st": {}, "thumbnail": None}
+        exif_bytes = piexif.dump(exif_dict)
+
+        # Insert EXIF and return binary
+        out_bytes = piexif.insert(exif_bytes, jpeg_bytes)
+        return Response(
+            content=out_bytes,
+            media_type="image/jpeg",
+            headers={"Content-Disposition": f'attachment; filename="geotagged.jpg"'},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/")
+def root():
+    return {"endpoints": ["/healthz", "/docs", "/geotag (POST multipart/form-data)"]}

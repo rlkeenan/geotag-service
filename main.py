@@ -1,102 +1,98 @@
-# main.py
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
-from typing import Optional
+import os
+import io
+from typing import Optional, Tuple
+
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Security
+from fastapi.security.api_key import APIKeyHeader
+from starlette.responses import StreamingResponse, JSONResponse
 from PIL import Image
 import piexif
-import io
 
-app = FastAPI(title="Geotag Service")
+app = FastAPI(title="Geotag Service", version="1.0.0")
 
+# -------- Security: API key via header --------
+API_KEY = os.getenv("API_KEY")  # set in Render → Environment
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
+async def require_key(key: Optional[str] = Security(api_key_header)):
+    if not API_KEY:
+        # If you forgot to set it in Render, block by default
+        raise HTTPException(status_code=500, detail="Server missing API_KEY")
+    if not key or key != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return True
+
+# -------- Health check --------
 @app.get("/healthz")
-def healthz():
+def healthz() -> dict:
     return {"status": "ok"}
 
+# -------- helpers for GPS EXIF --------
+def _deg_to_dms_rational(deg: float) -> Tuple[tuple, int]:
+    sign = 1 if deg >= 0 else -1
+    deg = abs(deg)
+    d = int(deg)
+    m_float = (deg - d) * 60
+    m = int(m_float)
+    s = round((m_float - m) * 60 * 10000)
+    return ((d, 1), (m, 1), (s, 10000)), sign
 
-def _to_rational_dms(value: float):
-    """
-    Convert signed decimal degrees to EXIF rational DMS tuples.
-    EXIF expects ((deg,1), (min,1), (sec,1e6)) – all positive.
-    """
-    v = abs(value)
-    deg = int(v)
-    minutes_float = (v - deg) * 60
-    minutes = int(minutes_float)
-    seconds = round((minutes_float - minutes) * 60 * 1_000_000)
-    return ((deg, 1), (minutes, 1), (seconds, 1_000_000))
-
-
-@app.post("/geotag")
-async def geotag(
-    file: UploadFile = File(..., description="JPEG image to tag"),
-    lat: float = Form(..., description="Latitude in decimal degrees"),
-    lon: float = Form(..., description="Longitude in decimal degrees"),
-    address: Optional[str] = Form(None),
-):
-    # Basic validation
-    if not file.content_type or "image" not in file.content_type:
-        raise HTTPException(status_code=415, detail="Only image uploads are accepted.")
-    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
-        raise HTTPException(status_code=422, detail="Invalid latitude/longitude.")
-
-    # Read upload to memory and open with Pillow
-    raw = await file.read()
-    try:
-        img = Image.open(io.BytesIO(raw))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Unable to read image file.")
-
-    # Build or load EXIF
-    exif_src = img.info.get("exif")
-    if exif_src:
+def _apply_gps_exif(img: Image.Image, lat: float, lon: float, desc: Optional[str]) -> bytes:
+    # load existing exif if present
+    exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+    raw = img.info.get("exif")
+    if raw:
         try:
-            exif_dict = piexif.load(exif_src)
+            exif_dict = piexif.load(raw)
         except Exception:
-            # Fall back to a fresh structure if parsing fails
             exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
-    else:
-        exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
 
-    # GPS tags
-    gps_ifd = exif_dict.get("GPS", {})
-    gps_ifd[piexif.GPSIFD.GPSLatitudeRef] = b"N" if lat >= 0 else b"S"
-    gps_ifd[piexif.GPSIFD.GPSLongitudeRef] = b"E" if lon >= 0 else b"W"
-    gps_ifd[piexif.GPSIFD.GPSLatitude] = _to_rational_dms(lat)
-    gps_ifd[piexif.GPSIFD.GPSLongitude] = _to_rational_dms(lon)
+    lat_dms, lat_sign = _deg_to_dms_rational(lat)
+    lon_dms, lon_sign = _deg_to_dms_rational(lon)
 
-    # Optional: store address in a user comment (0th IFD)
-    if address:
-        # EXIF UserComment must be bytes; prefix with ASCII tag
-        user_comment = b"ASCII\x00\x00\x00" + address.encode("utf-8", errors="ignore")
-        exif_dict["Exif"][piexif.ExifIFD.UserComment] = user_comment
+    exif_dict["GPS"][piexif.GPSIFD.GPSLatitudeRef]  = "N" if lat_sign >= 0 else "S"
+    exif_dict["GPS"][piexif.GPSIFD.GPSLatitude]     = lat_dms
+    exif_dict["GPS"][piexif.GPSIFD.GPSLongitudeRef] = "E" if lon_sign >= 0 else "W"
+    exif_dict["GPS"][piexif.GPSIFD.GPSLongitude]    = lon_dms
 
-    exif_dict["GPS"] = gps_ifd
-    exif_bytes = piexif.dump(exif_dict)
-
-    # Ensure JPEG output (EXIF is preserved in JPEG)
-    if img.mode != "RGB":
-        img = img.convert("RGB")
+    if desc:
+        exif_dict["0th"][piexif.ImageIFD.ImageDescription] = desc.encode("utf-8", "ignore")
 
     out = io.BytesIO()
-    try:
-        img.save(out, format="JPEG", exif=exif_bytes, quality=95, optimize=True)
-    except Exception:
-        # If save with EXIF fails, emit a clear error
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Failed to embed EXIF GPS data into image."},
-        )
+    # Ensure JPEG with EXIF block
+    save_img = img
+    if save_img.mode not in ("RGB", "L"):
+        save_img = save_img.convert("RGB")
+    save_img.save(out, format="JPEG", exif=piexif.dump(exif_dict), quality=92)
     out.seek(0)
+    return out.getvalue()
 
-    return StreamingResponse(
-        out,
-        media_type="image/jpeg",
-        headers={"Content-Disposition": 'attachment; filename="geotagged.jpg"'},
-    )
+# -------- main endpoint --------
+@app.post("/geotag", dependencies=[Depends(require_key)], response_class=StreamingResponse)
+async def geotag(
+    file: UploadFile = File(...),
+    lat: float = Form(...),
+    lon: float = Form(...),
+    address: Optional[str] = Form(None),
+):
+    # basic validation
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=415, detail="Only image uploads are accepted")
 
+    content = await file.read()
+    if len(content) > 20 * 1024 * 1024:  # 20 MB guard
+        raise HTTPException(status_code=413, detail="File exceeds 20MB")
 
-if __name__ == "__main__":
-    import uvicorn
+    try:
+        img = Image.open(io.BytesIO(content))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image data")
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000)
+    try:
+        with_exif = _apply_gps_exif(img, lat, lon, address)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"EXIF write failed: {e}")
+
+    filename = f"geotagged_{file.filename or 'image.jpg'}"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(io.BytesIO(with_exif), media_type="image/jpeg", headers=headers)
